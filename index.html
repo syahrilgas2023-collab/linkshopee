@@ -1,0 +1,502 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Upload, Link as LinkIcon, Copy, Download, ExternalLink, Image as ImageIcon, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc } from 'firebase/firestore';
+
+// --- Firebase Initialization ---
+let app, auth, db, appId;
+try {
+  const firebaseConfig = {
+    apiKey: "AIzaSyA1eF7oyjhGoZRTLL9DMnnIaLQQRke-drg",
+    authDomain: "link-shopee-ku.firebaseapp.com",
+    projectId: "link-shopee-ku",
+    storageBucket: "link-shopee-ku.firebasestorage.app",
+    messagingSenderId: "271595348463",
+    appId: "1:271595348463:web:33f1f6e5b8bb1df2f5d61a",
+    measurementId: "G-8TWM8JXPW9"
+  };
+  
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+  appId = 'link-shopee-ku';
+} catch (error) {
+  console.error("Firebase initialization failed:", error);
+}
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [viewMode, setViewMode] = useState('loading'); // 'loading', 'create', 'redirect'
+  const [redirectData, setRedirectData] = useState(null);
+
+  // Form States
+  const [imagePreview, setImagePreview] = useState(null);
+  const [imageBase64, setImageBase64] = useState('');
+  const [shopeeLink, setShopeeLink] = useState('');
+  const [title, setTitle] = useState('Rekomendasi Produk Shopee!');
+  
+  // Status States
+  const [isProcessingImage, setIsProcessingImage] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatedUrl, setGeneratedUrl] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
+
+  const fileInputRef = useRef(null);
+
+  // 1. Initialize Auth & Routing
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          try {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } catch (tokenError) {
+            console.warn("Token kustom gagal (kemungkinan karena menggunakan Firebase sendiri). Beralih ke login anonim...", tokenError);
+            await signInAnonymously(auth);
+          }
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth Error:", err);
+        setErrorMsg("Gagal terhubung ke server otentikasi. Pastikan Anonymous Sign-in aktif di Firebase Anda.");
+        setViewMode('create');
+      }
+    };
+
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Check for Redirect ID in URL
+  useEffect(() => {
+    if (!user) return;
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const id = urlParams.get('id');
+
+    if (id) {
+      setViewMode('redirect');
+      fetchRedirectData(id);
+    } else {
+      setViewMode('create');
+    }
+  }, [user]);
+
+  // Fetch data for redirection
+  const fetchRedirectData = async (id) => {
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'links', id);
+      const docSnap = await getDoc(docRef);
+
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setRedirectData(data);
+        
+        // Attempt to inject meta tags for bots that execute simple JS
+        document.title = data.title || "Loading...";
+        
+        // Redirect after a tiny delay
+        setTimeout(() => {
+          window.location.replace(data.targetUrl);
+        }, 1500);
+      } else {
+        setErrorMsg("Link tidak ditemukan atau sudah kadaluarsa.");
+      }
+    } catch (err) {
+      console.error("Fetch error:", err);
+      setErrorMsg("Terjadi kesalahan saat memuat link.");
+    }
+  };
+
+  // 3. Handle Image Upload & Crop to 1:1
+  const handleImageChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      setErrorMsg("Mohon upload file gambar (JPG/PNG).");
+      return;
+    }
+
+    setIsProcessingImage(true);
+    setErrorMsg('');
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        // Create canvas to crop and resize
+        const canvas = document.createElement('canvas');
+        const TARGET_SIZE = 400; // Optimal size for OG thumbnail
+        canvas.width = TARGET_SIZE;
+        canvas.height = TARGET_SIZE;
+        const ctx = canvas.getContext('2d');
+
+        // Calculate crop to make it 1:1 (center crop)
+        const size = Math.min(img.width, img.height);
+        const startX = (img.width - size) / 2;
+        const startY = (img.height - size) / 2;
+
+        // Draw image onto canvas
+        ctx.fillStyle = '#ffffff'; // White background for transparency
+        ctx.fillRect(0, 0, TARGET_SIZE, TARGET_SIZE);
+        ctx.drawImage(img, startX, startY, size, size, 0, 0, TARGET_SIZE, TARGET_SIZE);
+
+        // Compress to Base64 (JPEG, 80% quality)
+        const base64Str = canvas.toDataURL('image/jpeg', 0.8);
+        
+        setImagePreview(URL.createObjectURL(file));
+        setImageBase64(base64Str);
+        setIsProcessingImage(false);
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // 4. Generate Firebase Link
+  const handleGenerateLink = async () => {
+    if (!imageBase64) {
+      setErrorMsg("Mohon upload gambar terlebih dahulu.");
+      return;
+    }
+    if (!shopeeLink || !shopeeLink.includes('shope')) {
+      setErrorMsg("Mohon masukkan link Shopee yang valid.");
+      return;
+    }
+
+    setIsGenerating(true);
+    setErrorMsg('');
+
+    try {
+      // Generate random 6-character ID
+      const id = Math.random().toString(36).substring(2, 8);
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'links', id);
+      
+      await setDoc(docRef, {
+        imageUrl: imageBase64, // Saved as base64 string
+        targetUrl: shopeeLink,
+        title: title || "Rekomendasi Produk Shopee",
+        createdAt: new Date().toISOString()
+      });
+
+      // Construct the shareable URL
+      const urlWithoutQuery = window.location.origin + window.location.pathname;
+      const shareUrl = `${urlWithoutQuery}?id=${id}`;
+      setGeneratedUrl(shareUrl);
+      
+    } catch (err) {
+      console.error("Save error:", err);
+      setErrorMsg("Gagal membuat link. Coba lagi.");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // 5. Generate and Download HTML File (Foolproof method for WhatsApp/FB)
+  const downloadHTML = () => {
+    if (!imageBase64 || !shopeeLink) return;
+
+    const safeTitle = title.replace(/"/g, '&quot;');
+    const htmlContent = `<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${safeTitle}</title>
+    
+    <!-- Open Graph Tags (For WhatsApp, Facebook, dll) -->
+    <meta property="og:title" content="${safeTitle}" />
+    <meta property="og:description" content="Klik untuk melihat produk selengkapnya di Shopee!" />
+    <meta property="og:image" content="${imageBase64}" />
+    <meta property="og:url" content="${shopeeLink}" />
+    <meta property="og:type" content="website" />
+    
+    <!-- Twitter Cards -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="${safeTitle}">
+    <meta name="twitter:image" content="${imageBase64}">
+
+    <!-- Auto Redirect -->
+    <meta http-equiv="refresh" content="0; url=${shopeeLink}">
+    <script>
+        window.location.replace("${shopeeLink}");
+    </script>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f5f5; color: #333; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #ee4d2d; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 20px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        a { color: #ee4d2d; text-decoration: none; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="spinner"></div>
+        <h2>Mengarahkan ke Shopee...</h2>
+        <p>Jika tidak diarahkan otomatis, <a href="${shopeeLink}">Klik di sini</a>.</p>
+    </div>
+</body>
+</html>`;
+
+    const blob = new Blob([htmlContent], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Promo-Shopee-${Math.random().toString(36).substring(2,6)}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const copyToClipboard = () => {
+    try {
+      // Menggunakan document.execCommand('copy') karena API navigator.clipboard dibatasi di dalam iFrame
+      const textArea = document.createElement("textarea");
+      textArea.value = generatedUrl;
+      
+      // Sembunyikan textarea dari tampilan
+      textArea.style.position = "fixed";
+      textArea.style.left = "-999999px";
+      textArea.style.top = "-999999px";
+      
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      
+      const successful = document.execCommand("copy");
+      if (successful) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } else {
+        setErrorMsg("Gagal menyalin secara otomatis. Silakan salin manual pada kolom.");
+      }
+      
+      document.body.removeChild(textArea);
+    } catch (err) {
+      console.error("Copy error:", err);
+      setErrorMsg("Gagal menyalin secara otomatis. Silakan salin manual pada kolom.");
+    }
+  };
+
+  // --- RENDER REDIRECT MODE ---
+  if (viewMode === 'redirect') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
+        {errorMsg ? (
+          <div className="bg-white p-6 rounded-xl shadow-md text-center max-w-sm w-full">
+            <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
+            <h2 className="text-lg font-bold text-gray-800 mb-2">Oops!</h2>
+            <p className="text-gray-600 mb-4">{errorMsg}</p>
+            <button 
+              onClick={() => window.location.replace(window.location.origin + window.location.pathname)}
+              className="bg-[#ee4d2d] text-white px-6 py-2 rounded-lg font-medium"
+            >
+              Buat Link Baru
+            </button>
+          </div>
+        ) : (
+          <div className="bg-white p-8 rounded-xl shadow-md text-center max-w-sm w-full animate-pulse">
+            {redirectData?.imageUrl && (
+              <img src={redirectData.imageUrl} alt="Thumbnail" className="w-24 h-24 mx-auto rounded-lg object-cover mb-6 shadow-sm" />
+            )}
+            <Loader2 className="w-10 h-10 text-[#ee4d2d] animate-spin mx-auto mb-4" />
+            <h2 className="text-xl font-bold text-gray-800 mb-2">Mengarahkan...</h2>
+            <p className="text-gray-500 text-sm">Menuju ke produk Shopee pilihan Anda.</p>
+            {redirectData?.targetUrl && (
+              <a href={redirectData.targetUrl} className="mt-6 inline-block text-[#ee4d2d] text-sm font-medium hover:underline">
+                Klik di sini jika tidak otomatis
+              </a>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // --- RENDER LOADING STATE ---
+  if (viewMode === 'loading') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <Loader2 className="w-8 h-8 text-[#ee4d2d] animate-spin" />
+      </div>
+    );
+  }
+
+  // --- RENDER CREATOR MODE ---
+  return (
+    <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4 font-sans">
+      <div className="bg-white w-full max-w-lg rounded-2xl shadow-xl overflow-hidden">
+        
+        {/* Header */}
+        <div className="bg-[#ee4d2d] p-6 text-white text-center">
+          <h1 className="text-2xl font-bold mb-1">Shopee Link Generator</h1>
+          <p className="text-orange-100 text-sm">Buat thumbnail cantik untuk link affiliate Anda</p>
+        </div>
+
+        <div className="p-6 space-y-5">
+          {errorMsg && (
+            <div className="bg-red-50 text-red-600 p-3 rounded-lg text-sm flex items-start gap-2">
+              <AlertCircle className="w-5 h-5 shrink-0" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
+
+          {/* Image Upload Section */}
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-2">1. Gambar Thumbnail (Otomatis 1:1)</label>
+            <div 
+              onClick={() => fileInputRef.current?.click()}
+              className={`border-2 border-dashed rounded-xl p-4 text-center cursor-pointer transition-colors relative
+                ${imageBase64 ? 'border-orange-300 bg-orange-50' : 'border-gray-300 hover:border-[#ee4d2d] hover:bg-gray-50'}`}
+            >
+              <input 
+                type="file" 
+                ref={fileInputRef} 
+                onChange={handleImageChange} 
+                accept="image/jpeg, image/png, image/webp" 
+                className="hidden" 
+              />
+              
+              {isProcessingImage ? (
+                <div className="flex flex-col items-center justify-center py-8">
+                  <Loader2 className="w-8 h-8 text-[#ee4d2d] animate-spin mb-2" />
+                  <span className="text-sm text-gray-500">Memproses gambar...</span>
+                </div>
+              ) : imageBase64 ? (
+                <div className="flex flex-col items-center">
+                  <img src={imageBase64} alt="Preview" className="w-32 h-32 object-cover rounded-lg shadow-sm border border-gray-200 mb-3" />
+                  <span className="text-xs text-[#ee4d2d] font-medium flex items-center gap-1">
+                    <Upload className="w-3 h-3" /> Ganti Gambar
+                  </span>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-8 text-gray-500">
+                  <div className="bg-gray-100 p-3 rounded-full mb-3">
+                    <ImageIcon className="w-6 h-6 text-gray-400" />
+                  </div>
+                  <span className="text-sm font-medium text-gray-700">Klik untuk upload gambar</span>
+                  <span className="text-xs text-gray-400 mt-1">JPG, PNG maks 5MB</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Form Inputs */}
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-1">2. Link Shopee Affiliate</label>
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                  <LinkIcon className="h-5 w-5 text-gray-400" />
+                </div>
+                <input
+                  type="url"
+                  value={shopeeLink}
+                  onChange={(e) => setShopeeLink(e.target.value)}
+                  placeholder="https://shope.ee/..."
+                  className="w-full pl-10 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#ee4d2d] focus:border-[#ee4d2d] outline-none transition-all"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-semibold text-gray-700 mb-1">3. Judul Link (Opsional)</label>
+              <input
+                type="text"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Diskon 50% Sepatu Sneakers!"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#ee4d2d] focus:border-[#ee4d2d] outline-none transition-all"
+              />
+            </div>
+          </div>
+
+          {/* Action Area */}
+          {!generatedUrl ? (
+            <button
+              onClick={handleGenerateLink}
+              disabled={isGenerating || !imageBase64 || !shopeeLink}
+              className={`w-full py-3 rounded-lg font-bold text-white shadow-md transition-all flex items-center justify-center gap-2
+                ${isGenerating || !imageBase64 || !shopeeLink ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#ee4d2d] hover:bg-[#d74226] active:scale-[0.98]'}`}
+            >
+              {isGenerating ? <Loader2 className="w-5 h-5 animate-spin" /> : <LinkIcon className="w-5 h-5" />}
+              {isGenerating ? 'Membuat Link...' : 'Buat Link Share'}
+            </button>
+          ) : (
+            <div className="mt-6 p-5 bg-orange-50 border border-orange-200 rounded-xl space-y-4 animate-in fade-in zoom-in duration-300">
+              <div className="flex items-center gap-2 text-green-600 font-bold mb-2">
+                <CheckCircle2 className="w-5 h-5" />
+                <span>Berhasil Dibuat!</span>
+              </div>
+              
+              {/* Option 1: Copy Link */}
+              <div className="bg-white p-3 rounded-lg border border-gray-200">
+                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Opsi 1: Link Langsung</p>
+                <div className="flex gap-2">
+                  <input 
+                    type="text" 
+                    readOnly 
+                    value={generatedUrl}
+                    className="flex-1 bg-gray-50 text-sm border border-gray-200 rounded px-2 py-1 outline-none text-gray-600 truncate"
+                  />
+                  <button 
+                    onClick={copyToClipboard}
+                    className="bg-gray-800 text-white px-3 py-1.5 rounded flex items-center gap-1 hover:bg-gray-700 transition-colors text-sm font-medium shrink-0"
+                  >
+                    {copied ? <CheckCircle2 className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                    {copied ? 'Tersalin!' : 'Salin'}
+                  </button>
+                </div>
+                {/* Kotak peringatan merah telah dihapus dari sini karena aplikasi sudah di-deploy */}
+              </div>
+
+              <div className="flex items-center gap-4">
+                <div className="h-[1px] flex-1 bg-orange-200"></div>
+                <span className="text-xs text-orange-400 font-bold">ATAU</span>
+                <div className="h-[1px] flex-1 bg-orange-200"></div>
+              </div>
+
+              {/* Option 2: Download HTML */}
+              <div className="bg-white p-3 rounded-lg border border-orange-300 shadow-sm relative overflow-hidden">
+                <div className="absolute top-0 right-0 bg-[#ee4d2d] text-white text-[10px] font-bold px-2 py-1 rounded-bl-lg">
+                  REKOMENDASI WA/FB
+                </div>
+                <p className="text-xs font-semibold text-gray-800 uppercase tracking-wider mb-2">Opsi 2: Download File HTML</p>
+                <p className="text-xs text-gray-600 mb-3 leading-relaxed">
+                  Download file ini dan kirimkan langsung via WhatsApp/Telegram sebagai "Dokumen". Thumbnail <b>dijamin 100% muncul</b>!
+                </p>
+                <button
+                  onClick={downloadHTML}
+                  className="w-full bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg font-medium text-sm transition-colors flex items-center justify-center gap-2 shadow-sm"
+                >
+                  <Download className="w-4 h-4" />
+                  Download File HTML
+                </button>
+              </div>
+              
+              <button 
+                onClick={() => {
+                  setGeneratedUrl('');
+                  setImageBase64('');
+                  setShopeeLink('');
+                }}
+                className="w-full text-center text-sm text-gray-500 hover:text-gray-800 mt-2 font-medium"
+              >
+                Buat Baru
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
